@@ -1,30 +1,24 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json , expr
-from pyspark.sql.functions import sum as _sum
-from pyspark.sql.types import *
-
+import redis
 import json
+import time
 
-# 1. Create Spark session
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+from pyspark.sql.functions import col, from_json, expr, sum as _sum
+
+# 1. Spark session
 spark = SparkSession.builder \
-    .appName("AssetManagementConsumer") \
+    .appName("AssetManagementConsumerRedis") \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel("WARN")
 
-# 2. Kafka configuration
-topic = "asset-management-stream"
-kafka_bootstrap_servers = "kafka:9092"
+# 2. Redis connection
+r = redis.Redis(host='redis', port=6379)
+stream_key = "asset-management-stream"
+last_id = "0-0"  # start from beginning; use '$' to read only new events
 
-# 3. Read from Kafka topic as streaming DataFrame
-raw_df = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", kafka_bootstrap_servers) \
-    .option("subscribe", topic) \
-    .option("startingOffsets", "earliest") \
-    .load()
-
-# 4. Define schema for all messages (union of all event types)
+# 3. Unified schema definitions
 base_schema = StructType([
     StructField("type", StringType()),
     StructField("timestamp", DoubleType()),
@@ -55,54 +49,49 @@ portfolio_schema = base_schema \
     .add("total_value", DoubleType()) \
     .add("manager", StringType())
 
-# 5. Parse JSON values
-json_df = raw_df.selectExpr("CAST(value AS STRING) as json_string")
+# 4. Continuous batch loop
+print("🔄 Starting Redis consumer loop...")
+while True:
+    response = r.xread({stream_key: last_id}, block=5000, count=100)
+    if not response:
+        continue
 
-# 6. Filter and parse each type
-fx_df = json_df \
-    .filter("json_string LIKE '%fx_trade%'") \
-    .select(from_json(col("json_string"), fx_schema).alias("data")) \
-    .select("data.*")
+    data = []
+    for stream, messages in response:
+        for msg_id, msg in messages:
+            last_id = msg_id
+            flat_msg = {k.decode(): v.decode() for k, v in msg.items()}
+            data.append(flat_msg)
 
-stock_df = json_df \
-    .filter("json_string LIKE '%stock_trade%'") \
-    .select(from_json(col("json_string"), stock_schema).alias("data")) \
-    .select("data.*")
+    if not data:
+        continue
 
-portfolio_df = json_df \
-    .filter("json_string LIKE '%portfolio_valuation%'") \
-    .select(from_json(col("json_string"), portfolio_schema).alias("data")) \
-    .select("data.*")
+    # 5. Create Spark DataFrame
+    df = spark.read.json(spark.sparkContext.parallelize([json.dumps(d) for d in data]))
 
-# 7. Basic analytics examples
+    # 6. Separate streams by type
+    fx_df = df.filter(col("type") == "fx_trade").selectExpr("*")
+    stock_df = df.filter(col("type") == "stock_trade").selectExpr("*")
+    portfolio_df = df.filter(col("type") == "portfolio_valuation").selectExpr("*")
 
-# Total FX volume per pair
-fx_agg = fx_df.groupBy("fx_pair").agg(_sum("trade_volume").alias("total_volume"))
+    # 7. Type conversions for aggregations
+    fx_df = fx_df.withColumn("trade_volume", fx_df["trade_volume"].cast("double"))
+    stock_df = stock_df.withColumn("trade_volume", stock_df["trade_volume"].cast("int"))
+    portfolio_df = portfolio_df.withColumn("total_value", portfolio_df["total_value"].cast("double"))
 
-# Top 5 traded stocks by volume
-stock_agg = stock_df.groupBy("ticker").agg(_sum("trade_volume").alias("total_volume"))
+    # 8. Aggregations
+    fx_agg = fx_df.groupBy("fx_pair").agg(_sum("trade_volume").alias("total_volume"))
+    stock_agg = stock_df.groupBy("ticker").agg(_sum("trade_volume").alias("total_volume"))
+    portfolio_avg = portfolio_df.agg(expr("avg(total_value) as avg_portfolio_value"))
 
-# Average portfolio value
-portfolio_avg = portfolio_df.agg(expr("avg(total_value) as avg_portfolio_value"))
+    # 9. Output to console
+    print("\n📊 FX Aggregate:")
+    fx_agg.show(truncate=False)
 
-# 8. Output to console (for demo only)
-fx_query = fx_agg.writeStream \
-    .outputMode("complete") \
-    .format("console") \
-    .option("truncate", False) \
-    .start()
+    print("📈 Stock Aggregate:")
+    stock_agg.show(truncate=False)
 
-stock_query = stock_agg.writeStream \
-    .outputMode("complete") \
-    .format("console") \
-    .option("truncate", False) \
-    .start()
+    print("💼 Portfolio Average:")
+    portfolio_avg.show(truncate=False)
 
-portfolio_query = portfolio_avg.writeStream \
-    .outputMode("complete") \
-    .format("console") \
-    .option("truncate", False) \
-    .start()
-
-# 9. Await all streams
-spark.streams.awaitAnyTermination()
+    time.sleep(5)  # simulate micro-batch interval

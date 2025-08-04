@@ -1,25 +1,13 @@
 import time
 import json
 import random
+import redis
 from faker import Faker
-from kafka import KafkaProducer
-from kafka.errors import NoBrokersAvailable
-# Initialize Faker and Kafka
-fake = Faker()
-for attempt in range(20):
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers='kafka:9092',  # Docker Compose Kafka service name
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
-        print("KafkaProducer connected")
-        break
-    except NoBrokersAvailable as e:
-        print(f"Kafka not ready, retrying ({attempt + 1}/20)...")
-        time.sleep(10)
-else:
-    raise RuntimeError(" Kafka broker not available after 10 attempts")
 
+# Initialize Faker and Redis
+fake = Faker()
+r = redis.Redis(host='redis', port=6379)
+stream_key = "asset-management-stream"
 
 # Global config
 fx_pairs = ['EUR/USD', 'USD/JPY', 'GBP/USD', 'USD/CHF', 'AUD/USD']
@@ -28,14 +16,13 @@ stocks = ['AAPL', 'GOOG', 'TSLA', 'MSFT', 'AMZN']
 fx_rates = {pair: round(random.uniform(0.8, 1.2), 5) for pair in fx_pairs}  # initial FX rates
 
 
-# Update FX rates with small random drift
 def update_fx_rates():
+    """Apply small drift to FX rates"""
     for pair in fx_pairs:
         drift = random.uniform(-0.002, 0.002)
         fx_rates[pair] = max(0.4, round(fx_rates[pair] + drift, 5))
 
 
-# Generate fake FX trade
 def generate_fx_trade():
     pair = random.choice(fx_pairs)
     base_ccy, quote_ccy = pair.split('/')
@@ -55,7 +42,6 @@ def generate_fx_trade():
     }
 
 
-# Generate fake stock trade
 def generate_stock_trade():
     ticker = random.choice(stocks)
     price = round(random.uniform(50, 1500), 2)
@@ -73,7 +59,6 @@ def generate_stock_trade():
     }
 
 
-# Generate fake portfolio valuation
 def generate_portfolio_valuation():
     return {
         "type": "portfolio_valuation",
@@ -86,8 +71,7 @@ def generate_portfolio_valuation():
 
 
 # Stream loop
-topic = "asset-management-stream"
-print(f"Starting producer for topic: {topic}")
+print(f"🚀 Starting Redis producer -> stream: {stream_key}")
 
 try:
     while True:
@@ -97,11 +81,13 @@ try:
             weights=[0.4, 0.4, 0.2]
         )[0]()
 
-        producer.send(topic, event)
+        # Redis requires key-values as strings
+        redis_event = {k: str(v) for k, v in event.items()}
+
+        r.xadd(stream_key, redis_event)
         print(f"✅ Sent: {event}")
-        time.sleep(0.5)  # 2 events per second
+
+        time.sleep(0.5)  # ~2 events per second
+
 except KeyboardInterrupt:
-    print("Stopping producer...")
-finally:
-    producer.flush()
-    producer.close()
+    print("⛔️ Stopping producer...")
