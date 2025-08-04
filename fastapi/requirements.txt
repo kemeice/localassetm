@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+asyncpg
+neo4j
+pydantic
+sqlalchemy
